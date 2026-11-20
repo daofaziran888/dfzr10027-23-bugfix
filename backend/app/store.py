@@ -29,8 +29,11 @@ class Store:
         return None
 
     def overview(self) -> dict[str, object]:
+        # 下划线前缀是内部命名空间（管道产物、版本仓库等），不计入业务模块看板
         modules: list[dict[str, object]] = []
         for name in self.module_names():
+            if name.startswith("_"):
+                continue
             rows = self.rows(name)
             modules.append({
                 "name": name,
@@ -51,6 +54,13 @@ store = Store()
 
 
 def reset_store() -> None:
-    """重新初始化全局 store，用于测试隔离。"""
-    global store
-    store = Store()
+    """重新初始化全局 store，用于测试隔离。
+
+    原地清空并重新装填同一张表，而不是替换 Store 实例：各服务模块在导入时
+    用 ``from app.store import store`` 绑定的引用才能继续指向当前仓库，
+    避免测试重置后服务写入旧实例、断言读到新实例的错位。
+    """
+    store._tables = {
+        name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
+    }
+    store._tables.setdefault("_pipeline_results", [])

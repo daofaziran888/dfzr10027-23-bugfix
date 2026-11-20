@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import copy
 import math
 import statistics
 from datetime import date, datetime, timedelta
@@ -20,7 +21,8 @@ from app.fixtures import (
     QUALITY_CHECK_SAMPLES,
     TREND_POINTS,
 )
-from app.store import store
+from app import store as store_module
+from app.services.experiment_stat import experiment_stat_service
 
 # ---------------------------------------------------------------------------
 # 内部辅助
@@ -28,7 +30,7 @@ from app.store import store
 
 def _write_result(pipeline_id: str, payload: dict[str, Any]) -> None:
     """把管道产物写入 store._pipeline_results，支持追加与幂等覆盖。"""
-    table = store.rows("_pipeline_results")
+    table = store_module.store.rows("_pipeline_results")
     # 若同 pipeline_id 已存在则更新，否则追加
     for row in table:
         if row.get("pipeline_id") == pipeline_id:
@@ -41,7 +43,7 @@ def _write_result(pipeline_id: str, payload: dict[str, Any]) -> None:
 
 
 def _read_result(pipeline_id: str) -> dict[str, Any] | None:
-    for row in store.rows("_pipeline_results"):
+    for row in store_module.store.rows("_pipeline_results"):
         if row.get("pipeline_id") == pipeline_id:
             return dict(row)
     return None
@@ -274,16 +276,8 @@ def run_cohort_extract_pipeline(rule: dict[str, Any] | None = None) -> dict[str,
 # Pipeline 5: experiment -> stat_model -> data_mart
 # ---------------------------------------------------------------------------
 
-def run_experiment_stat_pipeline(experiment_code: str | None = None) -> dict[str, Any]:
-    """读取实验 fixtures，执行双比例 z 检验与效应量计算，产物写入数据集市。"""
-    rows = list(EXPERIMENT_RESULTS)
-    if experiment_code is None:
-        experiment_code = "EXPE-001"
-
-    exp_rows = [r for r in rows if r.get("实验编号") == experiment_code]
-    if len(exp_rows) < 2:
-        return {"error": "实验数据不足"}
-
+def _compute_experiment_stat(exp_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """对一组实验分组样本执行双比例 z 检验与效应量计算（纯函数，便于按版本复算）。"""
     control = next((r for r in exp_rows if r.get("分组") == "control"), None)
     treatment = next((r for r in exp_rows if r.get("分组") == "treatment"), None)
     if control is None or treatment is None:
@@ -293,6 +287,8 @@ def run_experiment_stat_pipeline(experiment_code: str | None = None) -> dict[str
     n_t = _to_int(treatment.get("样本量"))
     conv_c = _to_int(control.get("转化人数"))
     conv_t = _to_int(treatment.get("转化人数"))
+    if n_c <= 0 or n_t <= 0:
+        return {"error": "对照组或实验组样本量为 0，无法计算转化率"}
 
     p_c = conv_c / n_c if n_c else 0.0
     p_t = conv_t / n_t if n_t else 0.0
@@ -303,8 +299,7 @@ def run_experiment_stat_pipeline(experiment_code: str | None = None) -> dict[str
     # Cohen's h 效应量
     cohen_h = 2 * (math.asin(math.sqrt(p_t)) - math.asin(math.sqrt(p_c))) if (p_t >= 0 and p_c >= 0) else 0.0
 
-    result = {
-        "experiment_code": experiment_code,
+    return {
         "control_rate": round(p_c, 4),
         "treatment_rate": round(p_t, 4),
         "absolute_lift": round(p_t - p_c, 4),
@@ -314,26 +309,89 @@ def run_experiment_stat_pipeline(experiment_code: str | None = None) -> dict[str
         "significant_at_05": abs(z) > 1.96,
         "sample_size_control": n_c,
         "sample_size_treatment": n_t,
+        "conversions_control": conv_c,
+        "conversions_treatment": conv_t,
     }
 
-    # 同时写入 data_mart 可消费的统计摘要行
-    mart_entry = {
-        "主题编号": f"DATA-STAT-{experiment_code}",
-        "region": "all",
-        "channel": "all",
-        "日期": str(date.today()),
-        "实验编号": experiment_code,
-        "控制组转化率": result["control_rate"],
-        "实验组转化率": result["treatment_rate"],
-        "相对提升": result["relative_lift"],
-        "显著性": result["significant_at_05"],
-    }
-    store.rows("data_mart").append(mart_entry)
+
+def _resolve_observation_date(exp_rows: list[dict[str, Any]], explicit: str | None) -> str:
+    """样本观测日优先取显式入参，否则取样本自带日期；跨午夜补跑不会改变观测归属。"""
+    if explicit:
+        return str(explicit)
+    sample_dates = {str(r.get("日期")) for r in exp_rows if r.get("日期")}
+    if len(sample_dates) == 1:
+        return next(iter(sample_dates))
+    if sample_dates:
+        return sorted(sample_dates)[0]
+    return str(date.today())
+
+
+def run_experiment_stat_pipeline(
+    experiment_code: str | None = None,
+    observation_date: str | None = None,
+    sample_corrections: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """读取实验样本执行统计检验，并以版本化方式发布到数据集市。
+
+    - 观测日由样本日期决定（或显式传入），重跑/跨午夜补跑仍写入同一观测日；
+    - 同观测日重跑且结果不变时幂等复用原版本，集市不新增行；
+    - 同观测日样本更正会生成新版本，旧版本保留可回查，集市投影原地更新为当前版本。
+    """
+    # 深拷贝 fixtures：后续会改日期、合并更正，不能污染共享的原始样本，
+    # 否则下一次重跑会在已被更正的数据上再次计算，破坏同观测日重跑的幂等性
+    rows = copy.deepcopy(EXPERIMENT_RESULTS)
+    if experiment_code is None:
+        experiment_code = "EXPE-001"
+
+    exp_rows = [r for r in rows if r.get("实验编号") == experiment_code]
+    if len(exp_rows) < 2:
+        return {"error": "实验数据不足"}
+
+    obs_date = _resolve_observation_date(exp_rows, observation_date)
+    for row in exp_rows:
+        row["日期"] = obs_date
+
+    if sample_corrections:
+        # HTTP 入口的更正体只带分组，实验编号由查询参数确定，这里补齐合并键
+        normalized = []
+        for correction in sample_corrections:
+            item = dict(correction)
+            item.setdefault("实验编号", experiment_code)
+            normalized.append(item)
+        exp_rows = experiment_stat_service.merge_sample_corrections(
+            exp_rows, normalized
+        )
+        for row in exp_rows:
+            row["日期"] = obs_date
+            row["实验编号"] = experiment_code
+
+    result = _compute_experiment_stat(exp_rows)
+    if "error" in result:
+        return result
+    result["experiment_code"] = experiment_code
+    result["observation_date"] = obs_date
+
+    publication = experiment_stat_service.publish_stat(
+        experiment_code=experiment_code,
+        observation_date=obs_date,
+        payload=result,
+        samples=exp_rows,
+        source_run=f"pipeline:{datetime.now().isoformat()}",
+    )
+    result["stat_id"] = publication["stat_id"]
+    result["version"] = publication["version"]
+    result["version_id"] = publication["version_id"]
+    result["current_version"] = publication["current_version"]
+    result["publish_status"] = publication["status"]
+    result["replaced_previous"] = publication["replaced"]
 
     _write_result("experiment_stat_mart", {
         "source_modules": ["experiment", "stat_model"],
         "target_module": "data_mart",
         "payload": result,
+        "stat_id": publication["stat_id"],
+        "version_id": publication["version_id"],
+        "observation_date": obs_date,
     })
     return result
 
@@ -366,10 +424,10 @@ def run_quality_scan() -> dict[str, Any]:
 
     # 扫描 store 各模块的 abnormal 标记
     module_issues: list[dict] = []
-    for mod in store.module_names():
+    for mod in store_module.store.module_names():
         if mod.startswith("_"):
             continue
-        rows = store.rows(mod)
+        rows = store_module.store.rows(mod)
         abnormal_count = sum(1 for r in rows if r.get("abnormal"))
         if abnormal_count:
             module_issues.append({"module": mod, "abnormal_count": abnormal_count})
@@ -498,4 +556,4 @@ def run_all_pipelines() -> dict[str, Any]:
 
 
 def list_pipeline_results() -> list[dict[str, Any]]:
-    return [dict(r) for r in store.rows("_pipeline_results")]
+    return [dict(r) for r in store_module.store.rows("_pipeline_results")]

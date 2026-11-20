@@ -147,6 +147,23 @@ class TestExperimentStatPipeline:
         last = store.rows("data_mart")[-1]
         assert last.get("实验编号") == "EXPE-001"
 
+    def test_mart_entry_idempotent_on_rerun(self):
+        """同一份统计重跑两次：集市主题行不重复，观测日仍指向样本实际观测日。"""
+        run_experiment_stat_pipeline("EXPE-001")
+        after_first = len(store.rows("data_mart"))
+        run_experiment_stat_pipeline("EXPE-001")
+        after_second = len(store.rows("data_mart"))
+        assert after_second == after_first
+
+        stat_rows = [
+            row for row in store.rows("data_mart")
+            if row.get("主题编号") == "DATA-STAT-EXPE-001"
+        ]
+        assert len(stat_rows) == 1
+        # 观测日来自样本日期而非运行当天，跨午夜补跑仍归属同一观测日
+        assert stat_rows[0]["观测日"] == "2026-08-15"
+        assert stat_rows[0]["统计版本"] == 1
+
     def test_pipeline_result_written(self):
         run_experiment_stat_pipeline("EXPE-001")
         results = list_pipeline_results()

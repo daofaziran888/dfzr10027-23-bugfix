@@ -1,7 +1,10 @@
 """数据管道接口：触发跨模块计算并查询产物。"""
 from __future__ import annotations
 
+from typing import Any
+
 from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field
 
 from app.schemas import ActionResult
 from app.services.pipeline_orchestrator import (
@@ -17,6 +20,20 @@ from app.services.pipeline_orchestrator import (
 )
 
 router = APIRouter(prefix="/api/pipeline", tags=["数据管道"])
+
+
+class SampleCorrection(BaseModel):
+    """同观测日的单组样本更正：按 (实验编号, 分组) 覆盖原发布记录。"""
+
+    分组: str
+    样本量: int | None = None
+    转化人数: int | None = None
+    gmv_sum: float | None = None
+
+
+class ExperimentStatPayload(BaseModel):
+    observation_date: str | None = None
+    sample_corrections: list[SampleCorrection] = Field(default_factory=list)
 
 
 @router.post("/run-all", response_model=ActionResult)
@@ -63,8 +80,22 @@ def trigger_cohort_extract() -> ActionResult:
 @router.post("/experiment-stat", response_model=ActionResult)
 def trigger_experiment_stat(
     experiment_code: str | None = Query(default=None, description="实验编号"),
+    payload: ExperimentStatPayload | None = None,
 ) -> ActionResult:
-    result = run_experiment_stat_pipeline(experiment_code)
+    """执行实验统计管道。
+
+    可在请求体里指定观测日与同观测日的样本更正；重跑同一观测日且结果不变时
+    幂等复用原版本，样本更正则生成新版本并保留旧版本。
+    """
+    payload = payload or ExperimentStatPayload()
+    corrections: list[dict[str, Any]] = [
+        item.model_dump(exclude_none=True) for item in payload.sample_corrections
+    ]
+    result = run_experiment_stat_pipeline(
+        experiment_code,
+        observation_date=payload.observation_date,
+        sample_corrections=corrections or None,
+    )
     return ActionResult(ok=True, message="实验统计管道已执行", entry=result)
 
 

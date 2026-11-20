@@ -65,6 +65,48 @@ def export_entries(
         headers={"Content-Disposition": 'attachment; filename="data_mart.csv"'})
 
 
+@router.get("/experiment-stats", response_model=PageResult[dict])
+def list_experiment_stats(
+    experiment_code: str | None = Query(default=None, description="实验编号，如 EXPE-001"),
+) -> PageResult[dict]:
+    """实验统计分析主题：按实验与样本观测日返回唯一当前统计，重跑不重复。"""
+    items = service.list_experiment_stats(experiment_code)
+    return PageResult(items=items, total=len(items), page=1, size=len(items) or 1)
+
+
+@router.get("/experiment-stats/{experiment_code}/{observation_date}/versions")
+def list_experiment_stat_versions(experiment_code: str, observation_date: str) -> dict:
+    """同一观测日的全部统计版本（当前版本与被同日修订替代的历史版本）。"""
+    versions = service.list_experiment_stat_versions(experiment_code, observation_date)
+    if not versions:
+        raise HTTPException(
+            status_code=404,
+            detail=f"实验 {experiment_code} 在观测日 {observation_date} 没有统计版本",
+        )
+    return {"items": versions, "total": len(versions)}
+
+
+@router.get("/experiment-stats/{experiment_code}/{observation_date}")
+def get_experiment_stat(
+    experiment_code: str,
+    observation_date: str,
+    version: int | None = Query(default=None, description="不传返回当前版本，传入则回查指定历史版本"),
+) -> dict:
+    """读取某实验某观测日的统计；带版本号时按原版回查（报表复算用）。"""
+    if version is None:
+        entry = service.get_experiment_stat(experiment_code, observation_date)
+    else:
+        entry = service.get_experiment_stat_version(
+            experiment_code, observation_date, version
+        )
+    if entry is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"实验 {experiment_code} 观测日 {observation_date} 的统计版本不存在",
+        )
+    return entry
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
     """读取单条分析主题明细；不存在时给出可读的错误说明。"""

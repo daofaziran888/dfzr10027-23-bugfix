@@ -65,6 +65,34 @@ def export_entries(
         headers={"Content-Disposition": 'attachment; filename="report_gen.csv"'})
 
 
+@router.post("/experiment-reports/generate", response_model=ActionResult)
+def generate_experiment_report(payload: dict | None = None) -> ActionResult:
+    """基于数据集市当前统计版本生成实验报表，逐实验保留版本引用。"""
+    experiment_codes = (payload or {}).get("experiment_codes")
+    result = service.generate_experiment_report(experiment_codes)
+    return ActionResult(
+        ok=bool(result.get("ok")),
+        message=result.get("message", ""),
+        entry=result.get("report"),
+    )
+
+
+@router.get("/experiment-reports")
+def list_experiment_reports() -> dict:
+    """列出全部已生成的实验报表。"""
+    items = service.list_experiment_reports()
+    return {"items": items, "total": len(items)}
+
+
+@router.get("/experiment-reports/{report_id}/recompute")
+def recompute_experiment_report(report_id: int) -> dict:
+    """按报表引用的原始统计版本复算；旧版本被同日修订替代后仍可回查。"""
+    result = service.recompute_experiment_report(report_id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=404, detail=result.get("message", "报表不存在"))
+    return result
+
+
 @router.get("/{entry_id}", response_model=dict)
 def get_entry(entry_id: int) -> dict:
     """读取单条分析报表明细；不存在时给出可读的错误说明。"""
